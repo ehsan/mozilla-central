@@ -20,3 +20,6 @@ else:
     LIBXUL_LIBRARY = True
     EXPORT_LIBRARY = True
 
+CSRCS += [
+    '../build/msgMapi_i.c'
+]

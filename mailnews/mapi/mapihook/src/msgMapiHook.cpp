@@ -45,6 +45,7 @@
 #include "nsThreadUtils.h"
 #include "nsMsgUtils.h"
 #include "nsNetUtil.h"
+#include "mozilla/Monitor.h"
 #include "mozilla/Services.h"
 #include "nsIArray.h"
 #include "nsArrayUtils.h"
@@ -52,11 +53,14 @@
 
 extern PRLogModuleInfo *MAPI;
 
-class nsMAPISendListener : public nsIMsgSendListener
-{
-public:
-
-    virtual ~nsMAPISendListener() { }
+namespace {
+  class MAPISendListener : public nsIMsgSendListener,
+                           public mozilla::Monitor
+  {
+  public:
+    MAPISendListener()
+    : Monitor("MAPISendListener monitor"),
+      m_done(false) {}
 
     // nsISupports interface
     NS_DECL_THREADSAFE_ISUPPORTS
@@ -73,48 +77,67 @@ public:
     /* void OnStopSending (in string aMsgID, in nsresult aStatus, in wstring aMsg, in nsIFile returnFile); */
     NS_IMETHOD OnStopSending(const char *aMsgID, nsresult aStatus, const PRUnichar *aMsg,
                            nsIFile *returnFile) {
-        PR_CEnterMonitor(this);
-        PR_CNotifyAll(this);
+        mozilla::MonitorAutoLock mal(*this);
         m_done = true;
-        PR_CExitMonitor(this);
-        return NS_OK ;
+        NotifyAll();
+        return NS_OK;
     }
 
-	/* void OnSendNotPerformed */
-	NS_IMETHOD OnSendNotPerformed(const char *aMsgID, nsresult aStatus)
-	{
-		return OnStopSending(aMsgID, aStatus, nullptr, nullptr) ;
-	}
+  	NS_IMETHOD OnSendNotPerformed(const char *aMsgID, nsresult aStatus)
+	  {
+	  	return OnStopSending(aMsgID, aStatus, nullptr, nullptr) ;
+	  }
 
     /* void OnGetDraftFolderURI (); */
     NS_IMETHOD OnGetDraftFolderURI(const char *aFolderURI) {return NS_OK;}
 
-    static nsresult CreateMAPISendListener( nsIMsgSendListener **ppListener);
-
     bool IsDone() { return m_done ; }
-
-protected :
-    nsMAPISendListener() {
-        m_done = false;
-    }
-
+    
+  private:
     bool            m_done;
-};
+  };
 
-
-NS_IMPL_ISUPPORTS1(nsMAPISendListener, nsIMsgSendListener)
-
-nsresult nsMAPISendListener::CreateMAPISendListener( nsIMsgSendListener **ppListener)
-{
-    NS_ENSURE_ARG_POINTER(ppListener) ;
-
-    *ppListener = new nsMAPISendListener();
-    if (! *ppListener)
-        return NS_ERROR_OUT_OF_MEMORY;
-
-    NS_ADDREF(*ppListener);
-    return NS_OK;
+  /// Helper for setting up the hidden window for blind MAPI.
+  class MOZ_STACK_CLASS AutoHiddenWindow {
+  public:
+    AutoHiddenWindow(nsresult &rv)
+      : mAppService(do_GetService("@mozilla.org/appshell/appShellService;1"))
+    {
+      mCreatedHiddenWindow = false;
+      rv = mAppService->GetHiddenDOMWindow(getter_AddRefs(mHiddenWindow));
+      if (rv == NS_ERROR_FAILURE)
+      {
+        // Try to get a hidden window. If it doesn't exist, create a hidden
+        // window for us to use.
+        rv = mAppService->CreateHiddenWindow();
+        NS_ENSURE_SUCCESS_VOID(rv);
+        mCreatedHiddenWindow = true;
+        rv = mAppService->GetHiddenDOMWindow(getter_AddRefs(mHiddenWindow));
+      }
+      NS_ENSURE_SUCCESS_VOID(rv);
+    }
+    ~AutoHiddenWindow()
+    {
+      if (mCreatedHiddenWindow)
+        mAppService->DestroyHiddenWindow();
+    }
+    nsIDOMWindow *operator->()
+    {
+      return mHiddenWindow;
+    }
+    operator nsIDOMWindow *()
+    {
+      return mHiddenWindow;
+    }
+  private:
+    nsCOMPtr<nsIAppShellService> mAppService;
+    nsCOMPtr<nsIDOMWindow> mHiddenWindow;
+    bool mCreatedHiddenWindow;
+  };
 }
+
+
+NS_IMPL_ISUPPORTS1(MAPISendListener, nsIMsgSendListener)
 
 bool nsMapiHook::isMapiService = false;
 
@@ -283,20 +306,15 @@ nsMapiHook::IsBlindSendAllowed()
 // this is used for Send without UI
 nsresult nsMapiHook::BlindSendMail (unsigned long aSession, nsIMsgCompFields * aCompFields)
 {
-  nsresult rv = NS_OK ;
+  nsresult rv = NS_OK;
 
   if (!IsBlindSendAllowed())
     return NS_ERROR_FAILURE;
 
-  /** create nsIMsgComposeParams obj and other fields to populate it **/
+  // Get a hidden window to use for compose
+  AutoHiddenWindow hiddenWindow(rv);
+  NS_ENSURE_SUCCESS(rv, rv);
 
-  nsCOMPtr<nsIDOMWindow>  hiddenWindow;
-  // get parent window
-  nsCOMPtr<nsIAppShellService> appService = do_GetService( "@mozilla.org/appshell/appShellService;1", &rv);
-  if (NS_FAILED(rv)|| (!appService) ) return rv ;
-
-  rv = appService->GetHiddenDOMWindow(getter_AddRefs(hiddenWindow));
-  if ( NS_FAILED(rv) ) return rv ;
   // smtp password and Logged in used IdKey from MapiConfig (session obj)
   nsMAPIConfiguration * pMapiConfig = nsMAPIConfiguration::GetMAPIConfiguration() ;
   if (!pMapiConfig) return NS_ERROR_FAILURE ;  // get the singelton obj
@@ -318,9 +336,7 @@ nsresult nsMapiHook::BlindSendMail (unsigned long aSession, nsIMsgCompFields * a
   if (NS_FAILED(rv) ) return rv ;
 
   // create a send listener to get back the send status
-  nsCOMPtr <nsIMsgSendListener> sendListener ;
-  rv = nsMAPISendListener::CreateMAPISendListener(getter_AddRefs(sendListener)) ;
-  if (NS_FAILED(rv) || (!sendListener) ) return rv;
+  nsRefPtr<MAPISendListener> sendListener = new MAPISendListener;
 
   // create the compose params object
   nsCOMPtr<nsIMsgComposeParams> pMsgComposeParams (do_CreateInstance(NS_MSGCOMPOSEPARAMS_CONTRACTID, &rv));
@@ -338,33 +354,31 @@ nsresult nsMapiHook::BlindSendMail (unsigned long aSession, nsIMsgCompFields * a
 
   // create the nsIMsgCompose object to send the object
   nsCOMPtr<nsIMsgCompose> pMsgCompose (do_CreateInstance(NS_MSGCOMPOSE_CONTRACTID, &rv));
-  if (NS_FAILED(rv) || (!pMsgCompose) ) return rv ;
-
-  /** initialize nsIMsgCompose, Send the message, wait for send completion response **/
-
+  NS_ENSURE_SUCCESS(rv, rv);
   rv = pMsgCompose->Initialize(pMsgComposeParams, hiddenWindow, nullptr);
-  if (NS_FAILED(rv)) return rv ;
+  NS_ENSURE_SUCCESS(rv, rv);
 
-  // If we're in offline mode, we'll need to queue it for later. No point in trying to send it.
-  return pMsgCompose->SendMsg(WeAreOffline() ? nsIMsgSend::nsMsgQueueForLater : nsIMsgSend::nsMsgDeliverNow,
-			      pMsgId, nullptr, nullptr, nullptr);
-  if (NS_FAILED(rv)) return rv ;
+  // If we're in offline mode, we'll need to queue it for later.
+  rv = pMsgCompose->SendMsg(WeAreOffline() ? nsIMsgSend::nsMsgQueueForLater
+                                           : nsIMsgSend::nsMsgDeliverNow,
+			                      pMsgId, nullptr, nullptr, nullptr);
+  NS_ENSURE_SUCCESS(rv, rv);
 
-  // assign to interface pointer from nsCOMPtr to facilitate typecast below
-  nsIMsgSendListener * pSendListener = sendListener ;
+  // We need to wait to make sure that we only return when the send is
+  // completed. If we're offline, we're not sending yet, so don't bother
+  // waiting.
+  if (WeAreOffline())
+    return NS_OK;
 
-  // we need to wait here to make sure that we return only after send is completed
-  // so we will have a event loop here which will process the events till the Send IsDone.
   nsCOMPtr<nsIThread> thread(do_GetCurrentThread());
-  while ( !((nsMAPISendListener *) pSendListener)->IsDone() )
+  while (!sendListener->IsDone())
   {
-    PR_CEnterMonitor(pSendListener);
-    PR_CWait(pSendListener, PR_MicrosecondsToInterval(1000UL));
-    PR_CExitMonitor(pSendListener);
+    mozilla::MonitorAutoLock mal(*sendListener);
+    sendListener->Wait(PR_MicrosecondsToInterval(1000UL));
     NS_ProcessPendingEvents(thread);
   }
 
-  return rv ;
+  return rv;
 }
 
 // this is used to populate comp fields with Unicode data
@@ -697,8 +711,8 @@ nsresult nsMapiHook::PopulateCompFieldsForSendDocs(nsIMsgCompFields * aCompField
   if (strDelimChars.IsEmpty())
       strDelimChars.AssignLiteral(";");
 
-  int32_t offset = 0 ;
-  int32_t FilePathsLen = strFilePaths.Length() ;
+  uint32_t offset = 0 ;
+  uint32_t FilePathsLen = strFilePaths.Length() ;
   if (FilePathsLen)
   {
     nsAutoString Subject ;
@@ -804,9 +818,7 @@ nsresult nsMapiHook::ShowComposerWindow (unsigned long aSession, nsIMsgCompField
     nsresult rv = NS_OK ;
 
     // create a send listener to get back the send status
-    nsCOMPtr <nsIMsgSendListener> sendListener ;
-    rv = nsMAPISendListener::CreateMAPISendListener(getter_AddRefs(sendListener)) ;
-    if (NS_FAILED(rv) || (!sendListener) ) return rv ;
+    nsRefPtr<MAPISendListener> sendListener = new MAPISendListener;
 
     // create the compose params object
     nsCOMPtr<nsIMsgComposeParams> pMsgComposeParams (do_CreateInstance(NS_MSGCOMPOSEPARAMS_CONTRACTID, &rv));
