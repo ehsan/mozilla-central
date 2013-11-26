@@ -261,5 +261,8 @@ js/src/export: mfbt/export
 ifdef ENABLE_CLANG_PLUGIN
 js/src/export config/export: build/clang-plugin/export
 endif
+ifdef MOZ_LDAP_XPCOM
+ldap/export: config/export
+endif
 endif
 endif
