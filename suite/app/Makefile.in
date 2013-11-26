@@ -24,9 +24,9 @@ else
 # Build a binary bootstrapping with XRE_main
 
 LOCAL_INCLUDES += \
-  -I$(MOZILLA_SRCDIR)/toolkit/xre \
-  -I$(MOZILLA_SRCDIR)/xpcom/base \
-  -I$(MOZILLA_SRCDIR)/xpcom/build \
+  -I$(topsrcdir)/toolkit/xre \
+  -I$(topsrcdir)/xpcom/base \
+  -I$(topsrcdir)/xpcom/build \
   -I$(DEPTH)/mozilla/build \
   $(NULL)
 
@@ -75,7 +75,7 @@ endif
 ifeq ($(OS_ARCH),OS2)
 RESFILE = splashos2.res
 RCFLAGS += -DMOZ_SUITE
-RCFLAGS += -i $(MOZILLA_SRCDIR)/toolkit/xre
+RCFLAGS += -i $(topsrcdir)/toolkit/xre
 RCFLAGS += -DSEAMONKEY_ICO=\"$(DIST)/branding/seamonkey.ico\"
 endif
 

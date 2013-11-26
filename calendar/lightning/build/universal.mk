@@ -15,7 +15,7 @@ topsrcdir = $(TOPSRCDIR)
 DEPTH = $(OBJDIR)
 
 include $(DEPTH)/config/autoconf.mk
-include $(topsrcdir)/mozilla/toolkit/mozapps/installer/package-name.mk
+include $(topsrcdir)/toolkit/mozapps/installer/package-name.mk
 
 LIGHTNING_VERSION := $(shell cat $(topsrcdir)/calendar/sunbird/config/version.txt)
 XPI_PKGNAME = lightning-$(LIGHTNING_VERSION).$(AB_CD).$(MOZ_PKG_PLATFORM)
